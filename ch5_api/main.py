@@ -1,11 +1,18 @@
 import os
+import re
 from contextlib import asynccontextmanager
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+
+MP3_DIR = Path(__file__).resolve().parent.parent / "data" / "MP3-Example"
+TRACK_ID_RE = re.compile(r"TR[A-Z0-9]{16}")
 
 engine = create_engine(
     URL.create(
@@ -52,6 +59,17 @@ def query(sql, **params):
         return [dict(r) for r in conn.execute(text(sql), params).mappings()]
 
 
+@lru_cache(maxsize=1)
+def mp3_index():
+    """Map available sample track IDs to their local MP3 files."""
+    index = {}
+    for path in MP3_DIR.rglob("*.mp3"):
+        match = TRACK_ID_RE.search(path.stem)
+        if match:
+            index[match.group(0)] = path
+    return index
+
+
 @app.get("/search")
 def search(q: str = Query(..., min_length=1), limit: int = Query(20, le=100)):
     """Search tracks by name or artist (case-insensitive, partial match)."""
@@ -69,6 +87,17 @@ def get_track(track_id: str):
     if not rows:
         raise HTTPException(404, "Track not found")
     return rows[0]
+
+
+@app.get("/tracks/{track_id}/audio")
+def get_track_audio(track_id: str):
+    """Stream the available MP3 sample for a track."""
+    if not TRACK_ID_RE.fullmatch(track_id):
+        raise HTTPException(404, "Audio sample not found")
+    path = mp3_index().get(track_id)
+    if path is None:
+        raise HTTPException(404, "Audio sample not found")
+    return FileResponse(path, media_type="audio/mpeg", filename=path.name)
 
 
 @app.get("/popular")
@@ -144,4 +173,13 @@ def user_history(user_id: str, limit: int = Query(20, le=100)):
            FROM listening_history h JOIN tracks t USING (track_id)
            WHERE h.user_id = :u ORDER BY h.playcount DESC LIMIT :limit""",
         u=user_id, limit=limit,
+    )
+    
+@app.post("/tracks/lookup")
+def lookup_tracks(ids: list[str]):
+    """Names and artists for a list of track IDs."""
+    return query(
+        """SELECT track_id, name, artist, genre FROM tracks
+           WHERE track_id = ANY(:ids)""",
+        ids=ids,
     )

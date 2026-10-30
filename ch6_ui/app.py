@@ -1,4 +1,6 @@
 import html
+import re
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -6,6 +8,8 @@ import streamlit as st
 
 API = "http://127.0.0.1:8000"
 EXAMPLE_USER = "4e11f45d732f4861772b2906f81a7d384552ad12"
+MP3_DIR = Path(__file__).resolve().parent.parent / "data" / "MP3-Example"
+ID_RE = re.compile(r"TR[A-Z0-9]{16}")
 
 st.set_page_config(
     page_title="Soundwave | Music discovery",
@@ -306,6 +310,60 @@ def call(path, **params):
         st.stop()
 
 
+def lookup_tracks(track_ids):
+    try:
+        response = requests.post(
+            f"{API}/tracks/lookup",
+            json=track_ids,
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot reach the API. Is uvicorn running on port 8000?")
+        st.stop()
+    except requests.RequestException as error:
+        st.error(f"API error: {error}")
+        st.stop()
+
+
+@st.cache_data
+def mp3_index():
+    """Map track IDs to sample paths based on the names of MP3 files."""
+    index = {}
+    for path in MP3_DIR.rglob("*.mp3"):
+        match = ID_RE.search(path.stem)
+        if match:
+            index[match.group(0)] = str(path)
+    return index
+
+
+def play(track_id):
+    if track_id not in mp3_index():
+        st.caption("No audio sample for this track.")
+        return
+    audio = audio_sample(track_id)
+    if audio is not None:
+        st.audio(audio, format="audio/mpeg")
+
+
+@st.cache_data
+def audio_sample(track_id):
+    """Fetch an MP3 sample from the API, or return None when it is unavailable."""
+    try:
+        response = requests.get(f"{API}/tracks/{track_id}/audio", timeout=60)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.content
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot reach the API. Is uvicorn running on port 8000?")
+        st.stop()
+    except requests.RequestException as error:
+        st.error(f"Audio playback error: {error}")
+        st.stop()
+
+
 def show_tracks(rows, metric=None):
     for row in rows:
         title = html.escape(str(row.get("name") or "Unknown track"))
@@ -341,8 +399,19 @@ def show_tracks(rows, metric=None):
         )
 
 
-tab_search, tab_popular, tab_user = st.tabs(
-    ["⌕  Discover", "♫  Popular tracks", "✦  For a listener"]
+def show_tracks_with_audio(rows, metric=None):
+    show_tracks(rows, metric=metric)
+    files = mp3_index()
+    playable = [row for row in rows if row.get("track_id") in files]
+    if playable:
+        st.markdown("**🎧 Tracks with audio samples**")
+        for row in playable:
+            st.write(f"{row['name']} — {row['artist']}")
+            play(row["track_id"])
+
+
+tab_search, tab_popular, tab_user, tab_audio = st.tabs(
+    ["⌕  Discover", "♫  Popular tracks", "✦  For a listener", "🎧  Audio samples"]
 )
 
 with tab_search:
@@ -362,13 +431,14 @@ with tab_search:
             st.warning("No songs found. Try a different title or artist.")
         else:
             st.markdown(f'<div class="section-heading">{len(results)} tracks found</div>', unsafe_allow_html=True)
-            show_tracks(results)
+            show_tracks_with_audio(results)
 
             labels = {
                 f"{row['name']} — {row['artist']}": row["track_id"]
                 for row in results
             }
             choice = st.selectbox("Choose a track for similar recommendations", list(labels))
+            play(labels[choice])
             n = st.slider("Recommendations", 5, 30, 10, key="n_similar")
             if st.button("Find similar tracks"):
                 recs = call(f"/recommend/similar/{labels[choice]}", limit=n)
@@ -379,7 +449,7 @@ with tab_search:
                         f'<div class="section-heading">Because you picked {html.escape(choice)}</div>',
                         unsafe_allow_html=True,
                     )
-                    show_tracks(recs, metric="similarity")
+                    show_tracks_with_audio(recs, metric="similarity")
                 else:
                     st.info("No similar tracks were found.")
 
@@ -395,7 +465,7 @@ with tab_popular:
         chart_data = pd.DataFrame(popular)
         chart_data["label"] = chart_data["name"] + " — " + chart_data["artist"]
         st.bar_chart(chart_data.set_index("label")["total_plays"], color="#1ed760")
-        show_tracks(popular, metric="total_plays")
+        show_tracks_with_audio(popular, metric="total_plays")
     else:
         st.info("No listening history is available yet.")
 
@@ -413,11 +483,38 @@ with tab_user:
             st.warning("No listening history found for that user ID.")
         else:
             st.markdown('<div class="section-heading">On repeat</div>', unsafe_allow_html=True)
-            show_tracks(history, metric="playcount")
+            show_tracks_with_audio(history, metric="playcount")
             with st.spinner("Finding listeners with a similar taste..."):
                 recs = call(f"/recommend/user/{user_id}", limit=n)
             if recs:
                 st.markdown('<div class="section-heading">Picked for you</div>', unsafe_allow_html=True)
-                show_tracks(recs, metric="score")
+                show_tracks_with_audio(recs, metric="score")
             else:
                 st.info("We couldn't find recommendations for this listener yet.")
+
+with tab_audio:
+    files = mp3_index()
+    if not files:
+        st.warning(f"No MP3 files found in {MP3_DIR}")
+    else:
+        genres = sorted(path.name for path in MP3_DIR.iterdir() if path.is_dir())
+        if not genres:
+            st.warning(f"No genre folders found in {MP3_DIR}")
+        else:
+            genre = st.selectbox("Genre folder", genres)
+            ids = sorted(
+                track_id
+                for track_id, path in files.items()
+                if Path(path).parent.name == genre
+            )
+            st.caption(f"{len(ids)} audio samples in {genre}")
+            count = st.slider("How many to show", 1, 20, 5, key="n_audio")
+            tracks = lookup_tracks(ids[:200])
+            info = {track["track_id"]: track for track in tracks}
+            displayed = 0
+            for track_id in ids[:200]:
+                track = info.get(track_id)
+                if track is not None and displayed < count:
+                    st.write(f"**{track['name']}** — {track['artist']}")
+                    play(track_id)
+                    displayed += 1
